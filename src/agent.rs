@@ -472,9 +472,15 @@ impl Agent {
     fn get_liar_value(honest_value: u64, max_value: u64) -> u64 {
         let value_to_skip = honest_value;
 
-        // Shorten the gen_range by 1 and increment by 1 if liar_value >= value_to_skip
-        // This effectively skips value_to_skip and is an alternative to a "loop until different"
-        // approach, which might require a theoretically unbounded number of tries
+        // Generate a value in [1, max_value] excluding value_to_skip, with uniform probability.
+        // This avoids a "loop until different" approach, which could require a theoretically
+        // unbounded number of retries (especially problematic when max_value is small).
+        //
+        // We use >= (not ==) because we need to shift ALL values at or above the skip point up by one.
+        // Example with max_value=5, value_to_skip=3: range [1,4] maps to {1,2,4,5}
+        //   - Values 1,2 stay unchanged (below skip point)
+        //   - Values 3,4 become 4,5 (at or above skip point, shifted up)
+        // Using == would cause collisions (both 3 and 4 would map to 4, and 5 would never appear).
         let mut liar_value = rand::thread_rng().gen_range(1..=(max_value - 1));
         if liar_value >= value_to_skip {
             liar_value += 1;
