@@ -8,7 +8,7 @@ use text_colorizer::Colorize;
 use tokio::spawn;
 use tokio::sync::oneshot;
 /// Represents the configuration for a game of Liars Lie.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub struct Game {
     /// Represents the state of the game. Should be set to `false` if the game is
     /// not ready to be played.
@@ -73,6 +73,23 @@ impl Game {
             "[+] The following agents compose this round's expert subset: ".bold(),
             subset_ids.join(", ")
         )
+    }
+
+    /// Prints a warning for every agent in `expert_subset` that has at least one relay protocol
+    /// violation recorded against it (tampered replies or undeclared missing peers), so the user
+    /// can see when a relay from this round has been caught misbehaving.
+    fn print_relay_violations(&self, expert_subset: &Vec<AgentConfig>) {
+        for agent in expert_subset {
+            let violations = self.game_client.get_relay_violations(agent.get_id());
+            if violations > 0 {
+                println!(
+                    "{} Agent {} has {} recorded relay violation(s) and may be untrustworthy.\n",
+                    "[!] warning:".bold().red(),
+                    agent.get_id(),
+                    violations
+                );
+            }
+        }
     }
 
     /// Resets all the fields of `Game` to their default values as specified by `Game::new()`.
@@ -501,12 +518,17 @@ impl Game {
             }
             Err(e) => println!("{}", e),
         }
+
+        self.print_relay_violations(&expert_subset);
     }
 
     /// This method selects a random set of agents containing the requested number of honest agents
     /// `num_honest` and number of liars `num_liars`. It ensures the set is composed only of agents
-    /// that are currently spawned and reachable. The method returns a `Vec<AgentConfig>` containing
-    /// information about the agents included in the set.
+    /// that are currently spawned and reachable, and prefers to exclude agents with at least one
+    /// recorded relay violation (see `Client::get_relay_violations`) from prior rounds, since
+    /// those relays have already been caught tampering with or omitting a peer's reply. The
+    /// method returns a `Vec<AgentConfig>` containing information about the agents included in
+    /// the set.
     fn get_expert_subset(&self, num_honest: u16, num_liars: u16) -> Vec<AgentConfig> {
         // Create a clone of the active_agents vector and remove all the agents whose status is
         // not equal to `AgentStatus::Ready`. Shuffle the resulting vector and use it to select
@@ -517,8 +539,16 @@ impl Game {
         // Keep only agents whose status is `AgentStatus::Ready`
         shuffled_agents.retain(|agent| agent.get_status() == AgentStatus::Ready);
 
+        // Prefer agents with no recorded relay violations; only fall back to a flagged agent if
+        // there aren't enough clean agents to fill the requested subset.
+        let (mut clean_agents, mut flagged_agents): (Vec<Agent>, Vec<Agent>) = shuffled_agents
+            .into_iter()
+            .partition(|agent| self.game_client.get_relay_violations(agent.get_id()) == 0);
         let mut rng = thread_rng();
-        shuffled_agents.shuffle(&mut rng);
+        clean_agents.shuffle(&mut rng);
+        flagged_agents.shuffle(&mut rng);
+        let mut shuffled_agents = clean_agents;
+        shuffled_agents.append(&mut flagged_agents);
 
         // Get `num_honest` honest agents
         let mut honest_agents: Vec<AgentConfig> = shuffled_agents

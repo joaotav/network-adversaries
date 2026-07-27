@@ -2,7 +2,7 @@ use anyhow::{bail, Context};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use text_colorizer::Colorize;
 use tokio::io;
 use tokio::net::TcpStream;
@@ -18,12 +18,17 @@ use crate::packet::{Packet, PeerResult};
 ///
 /// Clients are responsible for communicating with deployed agents
 /// and querying for their individual values to determine the network value.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
 pub struct Client {
     /// The client's Ed25519 key pair. Used for message authentication.
     keys: Keys,
     /// A vector containing information that allows the client to communicate with agents.
     peers: Vec<AgentConfig>,
+    /// Tracks, per relay agent ID, the number of relay protocol violations detected across
+    /// rounds played by this client (tampered replies or undeclared missing peers). Shared (not
+    /// duplicated) across clones of `Client`, since each round clones `self` into an `Arc` for
+    /// its concurrent per-peer tasks.
+    relay_violations: Arc<Mutex<HashMap<usize, u32>>>,
 }
 
 impl Client {
@@ -33,7 +38,22 @@ impl Client {
         Client {
             keys: Keys::new_key_pair(),
             peers: Vec::new(),
+            relay_violations: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Records a relay protocol violation attributed to the relay agent identified by
+    /// `relay_id`, incrementing its violation count.
+    fn record_relay_violation(&self, relay_id: usize) {
+        let mut violations = self.relay_violations.lock().unwrap();
+        *violations.entry(relay_id).or_insert(0) += 1;
+    }
+
+    /// Returns the number of relay protocol violations recorded so far against the relay agent
+    /// identified by `relay_id`.
+    pub fn get_relay_violations(&self, relay_id: usize) -> u32 {
+        let violations = self.relay_violations.lock().unwrap();
+        *violations.get(&relay_id).unwrap_or(&0)
     }
 
     /// Returns the client's keypair for message signing.
@@ -233,20 +253,23 @@ impl Client {
         }
     }
 
-    /// Receives and processes the contents of `Message::MsgFwdValues`. Returns a `Vec<Message>`
-    /// containing all the valid/authenticated messages extracted from `MsgFwdValues` and
-    /// `anyhow::Error` otherwise.
+    /// Receives and processes the contents of `Message::MsgFwdValues`, sent by the relay agent
+    /// identified by `relay_id`. Returns a `Vec<Message>` containing all the valid/authenticated
+    /// messages extracted from `MsgFwdValues` and `anyhow::Error` otherwise.
     ///
-    /// NOTE: a relay now reports one `PeerResult` per requested peer instead of simply omitting
-    /// peers it doesn't want the client to hear from, so a peer's absence from the wire format is
-    /// no longer possible without an explicit (if unsigned) `Unreachable` claim. This method does
-    /// not yet cross-check `Unreachable` claims against other relays or hold relays accountable
-    /// for omissions/contradictions - see follow-up work.
+    /// Any peer this client expected an answer for (i.e. every entry in `self.peers` other than
+    /// the relay itself) that `peer_results` doesn't account for at all - neither a `Reply` nor
+    /// an `Unreachable` claim - is recorded as a relay violation, since silently dropping a peer
+    /// entirely would otherwise bypass per-packet signature verification. A `Reply` whose
+    /// signature fails to verify (a tampered forward) is recorded the same way. `Unreachable`
+    /// claims are not yet cross-checked against other relays for contradictions - see follow-up
+    /// work.
     fn handle_msg_fwd_values(
         &self,
         message_bytes: &[u8],
         signature: &Option<Vec<u8>>,
         peer_results: &Vec<PeerResult>,
+        relay_id: usize,
         agent_pubkey: &str,
     ) -> anyhow::Result<Vec<Message>> {
         if let Some(signature) = signature {
@@ -258,16 +281,21 @@ impl Client {
         }
 
         let mut received_messages: Vec<Message> = Vec::new();
+        let mut covered_ids: HashSet<usize> = HashSet::new();
 
         for peer_result in peer_results {
             let packet = match peer_result {
                 PeerResult::Reply(packet) => packet,
-                // Not yet acted upon; see NOTE above.
-                PeerResult::Unreachable(_) => continue,
+                // Not yet cross-checked against other relays; see NOTE above.
+                PeerResult::Unreachable(agent_id) => {
+                    covered_ids.insert(*agent_id);
+                    continue;
+                }
             };
 
             match Message::deserialize_message(&packet.message) {
                 Ok(Message::MsgSendValue { agent_id, value }) => {
+                    covered_ids.insert(agent_id);
                     // Retrieve the public key of the agent who sent this `MsgSendValue`
                     if let Some(agent_pubkey) = self.get_agent_pubkey(agent_id) {
                         match Self::handle_msg_send_value(
@@ -279,8 +307,8 @@ impl Client {
                             Ok(()) => {
                                 received_messages.push(Message::MsgSendValue { agent_id, value })
                             }
-                            // If the signature of the MsgSendValue is invalid, ignore the value
-                            Err(_) => (),
+                            // Invalid signature: the relay tampered with the forwarded bytes
+                            Err(_) => self.record_relay_violation(relay_id),
                         }
                     }
                 }
@@ -291,6 +319,14 @@ impl Client {
                 Err(_) => (),
             }
         }
+
+        for expected_peer in &self.peers {
+            let expected_id = expected_peer.get_id();
+            if expected_id != relay_id && !covered_ids.contains(&expected_id) {
+                self.record_relay_violation(relay_id);
+            }
+        }
+
         Ok(received_messages)
     }
 
@@ -324,6 +360,7 @@ impl Client {
                 &reply_packet.message,
                 &reply_packet.msg_sig,
                 &peer_results,
+                agent_id,
                 agent_pubkey,
             ),
             Ok(other) => bail!("[!] error: expected MsgFwdValues, received {:?}\n", other),
@@ -560,5 +597,81 @@ mod tests {
         let agent_values = vec![];
         let network_values = Client::infer_network_value(&agent_values);
         assert!(network_values.is_none());
+    }
+
+    #[test]
+    fn test_handle_msg_fwd_values_flags_undeclared_missing_peer() {
+        let mut client = Client::new();
+        let peer_a_keys = Keys::new_key_pair();
+        let peer_b_keys = Keys::new_key_pair();
+        let relay_keys = Keys::new_key_pair();
+
+        client.peers = vec![
+            AgentConfig::new(1, "127.0.0.1", 9001, peer_a_keys.get_public_key()),
+            AgentConfig::new(2, "127.0.0.1", 9002, peer_b_keys.get_public_key()),
+        ];
+
+        let relay_id = 99;
+
+        // The relay only accounts for peer 1 (neither a Reply nor an Unreachable claim is given
+        // for peer 2), which should be flagged as a violation.
+        let value_message = Message::build_msg_send_value(42, 1).unwrap();
+        let value_sig = peer_a_keys.sign(&value_message).unwrap();
+        let peer_results = vec![PeerResult::Reply(Packet::new(value_message, Some(value_sig)))];
+
+        let fwd_message = Message::build_msg_fwd_values(relay_id, &peer_results).unwrap();
+        let fwd_sig = relay_keys.sign(&fwd_message).unwrap();
+
+        let received_messages = client
+            .handle_msg_fwd_values(
+                &fwd_message,
+                &Some(fwd_sig),
+                &peer_results,
+                relay_id,
+                relay_keys.get_public_key(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            received_messages,
+            vec![Message::MsgSendValue {
+                agent_id: 1,
+                value: 42
+            }]
+        );
+        assert_eq!(client.get_relay_violations(relay_id), 1);
+    }
+
+    #[test]
+    fn test_handle_msg_fwd_values_no_violation_when_fully_accounted() {
+        let mut client = Client::new();
+        let peer_a_keys = Keys::new_key_pair();
+        let relay_keys = Keys::new_key_pair();
+
+        client.peers = vec![AgentConfig::new(
+            1,
+            "127.0.0.1",
+            9001,
+            peer_a_keys.get_public_key(),
+        )];
+
+        let relay_id = 99;
+        let peer_results = vec![PeerResult::Unreachable(1)];
+
+        let fwd_message = Message::build_msg_fwd_values(relay_id, &peer_results).unwrap();
+        let fwd_sig = relay_keys.sign(&fwd_message).unwrap();
+
+        let received_messages = client
+            .handle_msg_fwd_values(
+                &fwd_message,
+                &Some(fwd_sig),
+                &peer_results,
+                relay_id,
+                relay_keys.get_public_key(),
+            )
+            .unwrap();
+
+        assert!(received_messages.is_empty());
+        assert_eq!(client.get_relay_violations(relay_id), 0);
     }
 }
