@@ -2,7 +2,7 @@ use bincode::{deserialize, serialize};
 use serde::{Deserialize, Serialize};
 
 use crate::agent_config::AgentConfig;
-use crate::packet::Packet;
+use crate::packet::PeerResult;
 
 /// Represents actions used by the game client and agents to communicate among themselves.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -18,10 +18,12 @@ pub enum Message {
         agent_id: usize,
         peer_addresses: Vec<AgentConfig>,
     },
-    /// Used by agents to forward other agents' values to the game's client.
+    /// Used by agents to forward other agents' values to the game's client. Contains one
+    /// `PeerResult` per peer the sending agent was asked to query, accounting for peers whose
+    /// replies could not be obtained instead of omitting them.
     MsgFwdValues {
         agent_id: usize,
-        peer_values: Vec<Packet>,
+        peer_results: Vec<PeerResult>,
     },
 }
 // NOTE: It would be an improvement to include nonces in messages in order to prevent replay attacks.
@@ -49,16 +51,16 @@ impl Message {
         Ok(message)
     }
 
-    /// Builds a `MsgFwdValues` containing the sending agent's ID `agent_id` and a `Vec<Packet>`
-    /// containing the replies, received from other agents, to be forwarded. Returns the message
-    /// serialized into binary format using bincode.
+    /// Builds a `MsgFwdValues` containing the sending agent's ID `agent_id` and a
+    /// `Vec<PeerResult>` containing the outcome of querying each requested peer, to be forwarded
+    /// to the game's client. Returns the message serialized into binary format using bincode.
     pub fn build_msg_fwd_values(
         agent_id: usize,
-        peer_replies: &Vec<Packet>,
+        peer_results: &Vec<PeerResult>,
     ) -> Result<Vec<u8>, bincode::Error> {
         let message = Message::MsgFwdValues {
             agent_id,
-            peer_values: peer_replies.to_vec(),
+            peer_results: peer_results.to_vec(),
         }
         .serialize_message()?;
         Ok(message)
@@ -97,6 +99,7 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packet::Packet;
 
     #[test]
     fn test_build_msg_query_value_ok() {
@@ -176,28 +179,24 @@ mod tests {
     #[test]
     fn build_msg_fwd_values_ok() {
         let message1 = Message::build_msg_send_value(10, 1).unwrap();
-        let message2 = Message::build_msg_send_value(15, 2).unwrap();
-
         let packet1 = Packet::new(message1.clone(), None);
-        let packet2 = Packet::new(message2.clone(), None);
 
-        let msg_fwd_values = Message::build_msg_fwd_values(50, &vec![packet1, packet2]);
+        let peer_results = vec![PeerResult::Reply(packet1), PeerResult::Unreachable(2)];
+
+        let msg_fwd_values = Message::build_msg_fwd_values(50, &peer_results);
 
         assert_eq!(
             Message::deserialize_message(&msg_fwd_values.unwrap()).unwrap(),
             Message::MsgFwdValues {
                 agent_id: 50,
-                peer_values: vec![
-                    Packet {
+                peer_results: vec![
+                    PeerResult::Reply(Packet {
                         message: message1,
                         msg_sig: None
-                    },
-                    Packet {
-                        message: message2,
-                        msg_sig: None
-                    }
+                    }),
+                    PeerResult::Unreachable(2),
                 ]
             }
-        )
+        );
     }
 }

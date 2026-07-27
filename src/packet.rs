@@ -34,3 +34,18 @@ impl Packet {
         deserialize(data)
     }
 }
+
+/// Represents the outcome of a relay agent's attempt to query an individual peer while
+/// processing a `MsgFetchValues` on the game client's behalf.
+///
+/// A relay must report one `PeerResult` per peer it was asked about, rather than simply
+/// omitting peers it doesn't want the client to hear from - this makes suppression of a live
+/// peer's reply an explicit, attributable claim instead of an invisible silent drop.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub enum PeerResult {
+    /// The queried peer's own signed `MsgSendValue` packet, forwarded verbatim.
+    Reply(Packet),
+    /// The relay's own claim (not signed by the named peer) that `agent_id` could not be
+    /// reached. Unlike `Reply`, this carries no cryptographic proof on its own.
+    Unreachable(usize),
+}

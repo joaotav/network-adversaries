@@ -12,7 +12,7 @@ use crate::agent_config::AgentConfig;
 use crate::keys::Keys;
 use crate::message::Message;
 use crate::network_utils::*;
-use crate::packet::Packet;
+use crate::packet::{Packet, PeerResult};
 
 static AGENT_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
 static BASE_PORT: AtomicUsize = AtomicUsize::new(5_000);
@@ -153,18 +153,32 @@ impl Agent {
         )
     }
 
-    /// Receives a Vec<Packet> containing packets to be forwarded to the game's client and tampers
-    /// with their contents with a probability equal to `Agent.tamper_chance`.
-    fn tamper_with_messages(&self, peer_values: &mut Vec<Packet>) -> Result<(), bincode::Error> {
+    /// Receives a `Vec<PeerResult>` containing the results to be forwarded to the game's client
+    /// and tampers with them with a probability equal to `Agent.tamper_chance`. Each `Reply` that
+    /// is chosen for tampering is either corrupted in place (detectable by the client via
+    /// signature verification) or suppressed entirely by relabeling it as `Unreachable` (not tied
+    /// to any signature, so it can only be caught by the client cross-checking this relay's
+    /// report against other relays' reports for the same peer).
+    fn tamper_with_messages(&self, peer_results: &mut [PeerResult]) -> Result<(), bincode::Error> {
         // For `tamper_chance` == 0.05, the probability of tampering wih any given message is 5%.
         let tamper_chance = (self.tamper_chance * 100.0) as i32;
 
-        for packet in peer_values {
+        for peer_result in peer_results.iter_mut() {
             let tamper_roll = rand::thread_rng().gen_range(0..=(100));
-            if tamper_roll <= tamper_chance {
-                packet.message =
+            if tamper_roll > tamper_chance {
+                continue;
+            }
+
+            if let PeerResult::Reply(packet) = peer_result {
+                if rand::thread_rng().gen_bool(0.5) {
                     // Change the message contained within the packet to an arbitrary message.
-                    Message::build_msg_send_value(tamper_roll as u64, tamper_roll as usize)?;
+                    packet.message =
+                        Message::build_msg_send_value(tamper_roll as u64, tamper_roll as usize)?;
+                } else if let Message::MsgSendValue { agent_id, .. } =
+                    Message::deserialize_message(&packet.message)?
+                {
+                    *peer_result = PeerResult::Unreachable(agent_id);
+                }
             }
         }
         Ok(())
@@ -214,10 +228,10 @@ impl Agent {
     /// the game's client.
     async fn send_msg_fwd_values(
         &self,
-        peer_values: &Vec<Packet>,
+        peer_results: &Vec<PeerResult>,
         client_socket: &mut TcpStream,
     ) -> anyhow::Result<()> {
-        let message = Message::build_msg_fwd_values(self.agent_id, peer_values)?;
+        let message = Message::build_msg_fwd_values(self.agent_id, peer_results)?;
         let message_signature = self.keys.sign(&message)?;
 
         let packet = Packet::build_packet(message, Some(message_signature))
@@ -256,23 +270,21 @@ impl Agent {
         }
 
         let mut agent_conn_handles = Vec::new();
-        let mut peer_values = Vec::new();
+        let mut peer_results = Vec::new();
         let agent_arc = Arc::new(self.clone());
 
         for peer in peer_addresses {
             let address = peer.get_address();
             let port = peer.get_port();
+            let peer_id = peer.get_id();
             let mut socket = match connect(address, port).await {
                 Ok(socket) => socket,
                 Err(e) => {
                     println!(
                         "[!] error: Agent {} failed to connect to (Agent ID: {} - {}:{}) - {}\n",
-                        self.agent_id,
-                        peer.get_id(),
-                        address,
-                        port,
-                        e
+                        self.agent_id, peer_id, address, port, e
                     );
+                    peer_results.push(PeerResult::Unreachable(peer_id));
                     continue;
                 }
             };
@@ -280,29 +292,35 @@ impl Agent {
             let querying_agent = agent_arc.clone();
             let handle =
                 spawn(async move { Self::send_msg_query_value(querying_agent, &mut socket).await });
-            agent_conn_handles.push(handle);
+            agent_conn_handles.push((peer_id, handle));
         }
 
-        for handle in agent_conn_handles {
+        for (peer_id, handle) in agent_conn_handles {
             match handle.await {
-                Ok(Ok(peer_value)) => {
-                    peer_values.push(peer_value);
+                Ok(Ok(peer_packet)) => {
+                    peer_results.push(PeerResult::Reply(peer_packet));
                 }
-                Ok(Err(e)) => println!("{}", e),
-                Err(e) => println!("[!] error: task panicked - {}\n", e),
+                Ok(Err(e)) => {
+                    println!("{}", e);
+                    peer_results.push(PeerResult::Unreachable(peer_id));
+                }
+                Err(e) => {
+                    println!("[!] error: task panicked - {}\n", e);
+                    peer_results.push(PeerResult::Unreachable(peer_id));
+                }
             }
         }
 
-        // If the agent is a liar, attempt to modify the messages before forwarding them to the client
+        // If the agent is a liar, attempt to modify the results before forwarding them to the client
         if self.is_liar() {
-            let received_replies = peer_values.clone();
-            if let Err(_) = self.tamper_with_messages(&mut peer_values) {
-                // If tampering fails, revert back to the original replies
-                peer_values = received_replies;
+            let received_results = peer_results.clone();
+            if let Err(_) = self.tamper_with_messages(&mut peer_results) {
+                // If tampering fails, revert back to the original results
+                peer_results = received_results;
             }
         }
 
-        self.send_msg_fwd_values(&peer_values, client_socket)
+        self.send_msg_fwd_values(&peer_results, client_socket)
             .await?;
 
         Ok(())
@@ -556,6 +574,60 @@ mod tests {
         assert_eq!(
             agent.to_config(),
             AgentConfig::new(1, "127.0.0.1", 9001, agent.keys.get_public_key(),)
+        );
+    }
+
+    #[test]
+    fn test_tamper_with_messages_always_tampers_when_chance_is_100() {
+        let agent = Agent {
+            agent_id: 1,
+            value: 10,
+            address: "127.0.0.1".to_owned(),
+            port: 9001,
+            keys: Keys::new_key_pair(),
+            game_client_pubkey: "Hv9PImawhJ9+0ulJ/dlKjxTu+vKcKnyoJG5ahh4+DjY=".to_owned(),
+            status: AgentStatus::Uninitialized,
+            is_liar: true,
+            tamper_chance: 1.0,
+        };
+
+        let original_message = Message::build_msg_send_value(50, 2).unwrap();
+        let packet = Packet::new(original_message.clone(), None);
+        let mut peer_results = vec![PeerResult::Reply(packet)];
+
+        agent.tamper_with_messages(&mut peer_results).unwrap();
+
+        // A tamper_chance of 1.0 guarantees every entry is tampered with, either by corrupting
+        // the forwarded message's bytes or by relabeling it as an unreachability claim.
+        match &peer_results[0] {
+            PeerResult::Reply(packet) => assert_ne!(packet.message, original_message),
+            PeerResult::Unreachable(agent_id) => assert_eq!(*agent_id, 2),
+        }
+    }
+
+    #[test]
+    fn test_tamper_with_messages_never_tampers_when_chance_is_zero() {
+        let agent = Agent {
+            agent_id: 1,
+            value: 10,
+            address: "127.0.0.1".to_owned(),
+            port: 9001,
+            keys: Keys::new_key_pair(),
+            game_client_pubkey: "Hv9PImawhJ9+0ulJ/dlKjxTu+vKcKnyoJG5ahh4+DjY=".to_owned(),
+            status: AgentStatus::Uninitialized,
+            is_liar: false,
+            tamper_chance: 0.0,
+        };
+
+        let original_message = Message::build_msg_send_value(50, 2).unwrap();
+        let packet = Packet::new(original_message.clone(), None);
+        let mut peer_results = vec![PeerResult::Reply(packet)];
+
+        agent.tamper_with_messages(&mut peer_results).unwrap();
+
+        assert_eq!(
+            peer_results[0],
+            PeerResult::Reply(Packet::new(original_message, None))
         );
     }
 }

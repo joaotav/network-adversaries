@@ -12,7 +12,7 @@ use crate::agent_config::AgentConfig;
 use crate::keys::Keys;
 use crate::message::Message;
 use crate::network_utils::*;
-use crate::packet::Packet;
+use crate::packet::{Packet, PeerResult};
 
 /// Represents a game client.
 ///
@@ -236,11 +236,17 @@ impl Client {
     /// Receives and processes the contents of `Message::MsgFwdValues`. Returns a `Vec<Message>`
     /// containing all the valid/authenticated messages extracted from `MsgFwdValues` and
     /// `anyhow::Error` otherwise.
+    ///
+    /// NOTE: a relay now reports one `PeerResult` per requested peer instead of simply omitting
+    /// peers it doesn't want the client to hear from, so a peer's absence from the wire format is
+    /// no longer possible without an explicit (if unsigned) `Unreachable` claim. This method does
+    /// not yet cross-check `Unreachable` claims against other relays or hold relays accountable
+    /// for omissions/contradictions - see follow-up work.
     fn handle_msg_fwd_values(
         &self,
         message_bytes: &[u8],
         signature: &Option<Vec<u8>>,
-        forwarded_replies: &Vec<Packet>,
+        peer_results: &Vec<PeerResult>,
         agent_pubkey: &str,
     ) -> anyhow::Result<Vec<Message>> {
         if let Some(signature) = signature {
@@ -253,7 +259,13 @@ impl Client {
 
         let mut received_messages: Vec<Message> = Vec::new();
 
-        for packet in forwarded_replies {
+        for peer_result in peer_results {
+            let packet = match peer_result {
+                PeerResult::Reply(packet) => packet,
+                // Not yet acted upon; see NOTE above.
+                PeerResult::Unreachable(_) => continue,
+            };
+
             match Message::deserialize_message(&packet.message) {
                 Ok(Message::MsgSendValue { agent_id, value }) => {
                     // Retrieve the public key of the agent who sent this `MsgSendValue`
@@ -308,10 +320,10 @@ impl Client {
         let reply_packet = Packet::unpack(&reply)?;
 
         match Message::deserialize_message(&reply_packet.message) {
-            Ok(Message::MsgFwdValues { peer_values, .. }) => client.handle_msg_fwd_values(
+            Ok(Message::MsgFwdValues { peer_results, .. }) => client.handle_msg_fwd_values(
                 &reply_packet.message,
                 &reply_packet.msg_sig,
-                &peer_values,
+                &peer_results,
                 agent_pubkey,
             ),
             Ok(other) => bail!("[!] error: expected MsgFwdValues, received {:?}\n", other),
