@@ -64,6 +64,7 @@ pub async fn connect(address: &str, port: usize) -> Result<TcpStream, io::Error>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tokio::net::TcpListener;
 
     // Test that get_length encodes a byte slice's length as a big-endian u32, including the
@@ -79,7 +80,10 @@ mod tests {
 
     // Test that a packet sent with connect()/send_packet() arrives intact via recv_packet() over
     // a real TCP socket (which itself exercises read_length_prefix()), to catch framing bugs that
-    // struct-level unit tests elsewhere in the codebase can't see
+    // struct-level unit tests elsewhere in the codebase can't see. The read side is wrapped in a
+    // timeout so a framing regression (e.g. a length prefix that overstates the body actually
+    // written) makes this test fail fast instead of hanging the test run forever - this repo has
+    // no CI/nextest timeout to fall back on.
     #[tokio::test]
     async fn test_send_and_recv_packet_round_trip() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -87,7 +91,10 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            recv_packet(&mut socket).await.unwrap()
+            tokio::time::timeout(Duration::from_secs(5), recv_packet(&mut socket))
+                .await
+                .expect("recv_packet timed out - possible framing regression")
+                .unwrap()
         });
 
         let mut client_socket = connect(&addr.ip().to_string(), addr.port() as usize)

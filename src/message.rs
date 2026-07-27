@@ -178,10 +178,20 @@ mod tests {
 
     #[test]
     fn build_msg_fwd_values_ok() {
+        // Covers two `Reply` entries alongside an `Unreachable` one, so a bug that only
+        // corrupts/drops entries when consecutive `Reply` variants are adjacent (e.g. an
+        // indexing mistake, or a broken derive) wouldn't slip past a single-`Reply` test.
         let message1 = Message::build_msg_send_value(10, 1).unwrap();
         let packet1 = Packet::new(message1.clone(), None);
 
-        let peer_results = vec![PeerResult::Reply(packet1), PeerResult::Unreachable(2)];
+        let message2 = Message::build_msg_send_value(15, 3).unwrap();
+        let packet2 = Packet::new(message2.clone(), None);
+
+        let peer_results = vec![
+            PeerResult::Reply(packet1),
+            PeerResult::Unreachable(2),
+            PeerResult::Reply(packet2),
+        ];
 
         let msg_fwd_values = Message::build_msg_fwd_values(50, &peer_results);
 
@@ -195,6 +205,10 @@ mod tests {
                         msg_sig: None
                     }),
                     PeerResult::Unreachable(2),
+                    PeerResult::Reply(Packet {
+                        message: message2,
+                        msg_sig: None
+                    }),
                 ]
             }
         );

@@ -579,6 +579,8 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_load_agent_config_ok() {
@@ -719,6 +721,67 @@ mod tests {
         assert_eq!(client.get_relay_violations(relay_id), 0);
     }
 
+    // Test that handle_msg_fwd_values accumulates multiple valid Reply entries from different
+    // peers independently, and that one entry with a bad signature (tampered content) is dropped
+    // and flagged without affecting the other, validly-signed entries in the same batch. This is
+    // the multi-peer forwarding loop a relay exercises in normal operation (most peers honest and
+    // reachable), which the single-Reply tests above don't cover on their own.
+    #[test]
+    fn test_handle_msg_fwd_values_accumulates_multiple_replies_independently() {
+        let mut client = Client::new();
+        let peer_a_keys = Keys::new_key_pair();
+        let peer_b_keys = Keys::new_key_pair();
+        let peer_c_keys = Keys::new_key_pair();
+        let relay_keys = Keys::new_key_pair();
+
+        client.peers = vec![
+            AgentConfig::new(1, "127.0.0.1", 9001, peer_a_keys.get_public_key()),
+            AgentConfig::new(2, "127.0.0.1", 9002, peer_b_keys.get_public_key()),
+            AgentConfig::new(3, "127.0.0.1", 9003, peer_c_keys.get_public_key()),
+        ];
+
+        let relay_id = 99;
+
+        let value_a = Message::build_msg_send_value(10, 1).unwrap();
+        let sig_a = peer_a_keys.sign(&value_a).unwrap();
+
+        let value_b = Message::build_msg_send_value(20, 2).unwrap();
+        let sig_b = peer_b_keys.sign(&value_b).unwrap();
+
+        // Peer 3's signature was produced for a different value than what's actually forwarded,
+        // simulating a relay that tampered with this one entry.
+        let value_c = Message::build_msg_send_value(30, 3).unwrap();
+        let sig_c = peer_c_keys.sign(&value_c).unwrap();
+        let tampered_value_c = Message::build_msg_send_value(99, 3).unwrap();
+
+        let peer_results = vec![
+            PeerResult::Reply(Packet::new(value_a, Some(sig_a))),
+            PeerResult::Reply(Packet::new(value_b, Some(sig_b))),
+            PeerResult::Reply(Packet::new(tampered_value_c, Some(sig_c))),
+        ];
+
+        let fwd_message = Message::build_msg_fwd_values(relay_id, &peer_results).unwrap();
+        let fwd_sig = relay_keys.sign(&fwd_message).unwrap();
+
+        let outcomes = client
+            .handle_msg_fwd_values(
+                &fwd_message,
+                &Some(fwd_sig),
+                &peer_results,
+                relay_id,
+                relay_keys.get_public_key(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcomes,
+            vec![(1, PeerOutcome::Value(10)), (2, PeerOutcome::Value(20))]
+        );
+        // Peer 3's tampered entry fails signature verification and is recorded as a violation,
+        // but doesn't prevent peers 1 and 2's valid entries from being accumulated above.
+        assert_eq!(client.get_relay_violations(relay_id), 1);
+    }
+
     #[test]
     fn test_reconcile_reports_flags_contradicted_unreachable_claim() {
         let client = Client::new();
@@ -765,5 +828,101 @@ mod tests {
 
         let values = Client::extract_unique_values(&reports);
         assert_eq!(values, HashSet::from([(1, 5)]));
+    }
+
+    // Test that play_expert_round, driven end-to-end over real TCP sockets against two fake
+    // relay agents, both recovers a contested peer's real value and flags the relay that falsely
+    // denied it - exercising the same reconciliation behavior as
+    // test_reconcile_reports_flags_contradicted_unreachable_claim above, but through the actual
+    // public seam (play_expert_round's return value and get_relay_violations) rather than
+    // reconcile_reports/extract_unique_values directly, so this test survives a refactor of how
+    // reports are accumulated internally.
+    #[tokio::test]
+    async fn test_play_expert_round_detects_contradicted_unreachable_claim_via_sockets() {
+        let mut client = Client::new();
+
+        let peer_keys = Keys::new_key_pair();
+        let honest_relay_keys = Keys::new_key_pair();
+        let lying_relay_keys = Keys::new_key_pair();
+
+        let peer_id = 5;
+        let honest_relay_id = 10;
+        let lying_relay_id = 20;
+
+        let honest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let honest_addr = honest_listener.local_addr().unwrap();
+
+        let lying_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lying_addr = lying_listener.local_addr().unwrap();
+
+        // Only the contested peer needs to be registered here: it's what `client.peers` is sent
+        // to relays as (the set they're asked to report on) and where inner `Reply` signatures
+        // are verified against. The relays' own pubkeys are supplied via `expert_subset` below.
+        client.peers = vec![AgentConfig::new(
+            peer_id,
+            "127.0.0.1",
+            9000,
+            peer_keys.get_public_key(),
+        )];
+
+        let expert_subset = vec![
+            AgentConfig::new(
+                honest_relay_id,
+                "127.0.0.1",
+                honest_addr.port() as usize,
+                honest_relay_keys.get_public_key(),
+            ),
+            AgentConfig::new(
+                lying_relay_id,
+                "127.0.0.1",
+                lying_addr.port() as usize,
+                lying_relay_keys.get_public_key(),
+            ),
+        ];
+
+        // Honest relay: replies with the peer's real, validly-signed value.
+        let honest_task = tokio::spawn(async move {
+            let (mut socket, _) = honest_listener.accept().await.unwrap();
+            let _request = tokio::time::timeout(Duration::from_secs(5), recv_packet(&mut socket))
+                .await
+                .unwrap()
+                .unwrap();
+
+            let value_message = Message::build_msg_send_value(7, peer_id).unwrap();
+            let value_sig = peer_keys.sign(&value_message).unwrap();
+            let peer_results = vec![PeerResult::Reply(Packet::new(value_message, Some(value_sig)))];
+
+            let fwd_message =
+                Message::build_msg_fwd_values(honest_relay_id, &peer_results).unwrap();
+            let fwd_sig = honest_relay_keys.sign(&fwd_message).unwrap();
+            let packet_bytes = Packet::build_packet(fwd_message, Some(fwd_sig)).unwrap();
+
+            send_packet(&packet_bytes, &mut socket).await.unwrap();
+        });
+
+        // Lying relay: falsely claims the same peer is unreachable, even though it's live.
+        let lying_task = tokio::spawn(async move {
+            let (mut socket, _) = lying_listener.accept().await.unwrap();
+            let _request = tokio::time::timeout(Duration::from_secs(5), recv_packet(&mut socket))
+                .await
+                .unwrap()
+                .unwrap();
+
+            let peer_results = vec![PeerResult::Unreachable(peer_id)];
+            let fwd_message = Message::build_msg_fwd_values(lying_relay_id, &peer_results).unwrap();
+            let fwd_sig = lying_relay_keys.sign(&fwd_message).unwrap();
+            let packet_bytes = Packet::build_packet(fwd_message, Some(fwd_sig)).unwrap();
+
+            send_packet(&packet_bytes, &mut socket).await.unwrap();
+        });
+
+        let agent_values = client.play_expert_round(&expert_subset).await.unwrap();
+
+        honest_task.await.unwrap();
+        lying_task.await.unwrap();
+
+        assert_eq!(agent_values, vec![7]);
+        assert_eq!(client.get_relay_violations(lying_relay_id), 1);
+        assert_eq!(client.get_relay_violations(honest_relay_id), 0);
     }
 }

@@ -160,11 +160,14 @@ impl Agent {
     /// to any signature, so it can only be caught by the client cross-checking this relay's
     /// report against other relays' reports for the same peer).
     fn tamper_with_messages(&self, peer_results: &mut [PeerResult]) -> Result<(), bincode::Error> {
-        // For `tamper_chance` == 0.05, the probability of tampering wih any given message is 5%.
+        // For `tamper_chance` == 0.05, the probability of tampering with any given message is
+        // exactly 5%. `tamper_roll` is drawn from 1..=100 (not 0..=100) specifically so that
+        // `tamper_chance` == 0 always skips tampering: a `0..=100` range would let `tamper_roll`
+        // land on 0 with ~1% probability, making a "never tamper" setting tamper anyway.
         let tamper_chance = (self.tamper_chance * 100.0) as i32;
 
         for peer_result in peer_results.iter_mut() {
-            let tamper_roll = rand::thread_rng().gen_range(0..=(100));
+            let tamper_roll = rand::thread_rng().gen_range(1..=100);
             if tamper_roll > tamper_chance {
                 continue;
             }
@@ -579,17 +582,15 @@ mod tests {
 
     #[test]
     fn test_tamper_with_messages_always_tampers_when_chance_is_100() {
-        let agent = Agent {
-            agent_id: 1,
-            value: 10,
-            address: "127.0.0.1".to_owned(),
-            port: 9001,
-            keys: Keys::new_key_pair(),
-            game_client_pubkey: "Hv9PImawhJ9+0ulJ/dlKjxTu+vKcKnyoJG5ahh4+DjY=".to_owned(),
-            status: AgentStatus::Uninitialized,
-            is_liar: true,
-            tamper_chance: 1.0,
-        };
+        // `Agent::new_liar` already produces `is_liar: true` with the requested `tamper_chance`;
+        // `tamper_with_messages` only ever reads `self.tamper_chance`, so the honest_value/
+        // max_value/pubkey arguments here are irrelevant to what this test exercises.
+        let agent = Agent::new_liar(
+            10,
+            100,
+            "Hv9PImawhJ9+0ulJ/dlKjxTu+vKcKnyoJG5ahh4+DjY=".to_owned(),
+            1.0,
+        );
 
         let original_message = Message::build_msg_send_value(50, 2).unwrap();
         let packet = Packet::new(original_message.clone(), None);
@@ -607,17 +608,8 @@ mod tests {
 
     #[test]
     fn test_tamper_with_messages_never_tampers_when_chance_is_zero() {
-        let agent = Agent {
-            agent_id: 1,
-            value: 10,
-            address: "127.0.0.1".to_owned(),
-            port: 9001,
-            keys: Keys::new_key_pair(),
-            game_client_pubkey: "Hv9PImawhJ9+0ulJ/dlKjxTu+vKcKnyoJG5ahh4+DjY=".to_owned(),
-            status: AgentStatus::Uninitialized,
-            is_liar: false,
-            tamper_chance: 0.0,
-        };
+        // `Agent::new_honest` already produces `is_liar: false, tamper_chance: 0.0`.
+        let agent = Agent::new_honest(10, "Hv9PImawhJ9+0ulJ/dlKjxTu+vKcKnyoJG5ahh4+DjY=".to_owned());
 
         let original_message = Message::build_msg_send_value(50, 2).unwrap();
         let packet = Packet::new(original_message.clone(), None);
