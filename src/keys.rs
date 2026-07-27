@@ -136,4 +136,49 @@ mod tests {
         assert_ne!(keys1.private_key, keys2.private_key);
         assert_ne!(keys1.public_key, keys2.public_key);
     }
+
+    // Test the public `Keys::sign`/`Keys::verify` pair round-trips successfully
+    #[test]
+    fn test_sign_and_verify_round_trip_ok() {
+        let keys = Keys::new_key_pair();
+        let message = b"a message to be signed";
+
+        let signature = keys.sign(message).unwrap();
+
+        assert!(Keys::verify(message, &signature, keys.get_public_key()).is_ok());
+    }
+
+    // Test that verification fails when the signature was produced by a different key pair
+    #[test]
+    fn test_verify_fails_with_wrong_public_key() {
+        let signer = Keys::new_key_pair();
+        let other = Keys::new_key_pair();
+        let message = b"a message to be signed";
+
+        let signature = signer.sign(message).unwrap();
+
+        assert!(Keys::verify(message, &signature, other.get_public_key()).is_err());
+    }
+
+    // Test that verification fails when the message doesn't match what was signed
+    #[test]
+    fn test_verify_fails_with_tampered_message() {
+        let keys = Keys::new_key_pair();
+        let message = b"original message";
+        let tampered_message = b"tampered message";
+
+        let signature = keys.sign(message).unwrap();
+
+        assert!(Keys::verify(tampered_message, &signature, keys.get_public_key()).is_err());
+    }
+
+    // Test that verification fails gracefully (rather than panicking) on a malformed public key
+    #[test]
+    fn test_verify_fails_with_malformed_public_key() {
+        let keys = Keys::new_key_pair();
+        let message = b"a message to be signed";
+        let signature = keys.sign(message).unwrap();
+
+        assert!(Keys::verify(message, &signature, "not-valid-base64!!!").is_err());
+    }
 }

@@ -49,3 +49,68 @@ pub enum PeerResult {
     /// reached. Unlike `Reply`, this carries no cryptographic proof on its own.
     Unreachable(usize),
 }
+
+// ******************************************************************************************
+// ************************************* UNIT TESTS *****************************************
+// ******************************************************************************************
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test that a Packet with a signature round-trips through build_packet/unpack unchanged
+    #[test]
+    fn test_build_and_unpack_packet_with_signature() {
+        let message = b"hello".to_vec();
+        let msg_sig = b"signature-bytes".to_vec();
+
+        let packet_bytes = Packet::build_packet(message.clone(), Some(msg_sig.clone())).unwrap();
+        let packet = Packet::unpack(&packet_bytes).unwrap();
+
+        assert_eq!(packet.message, message);
+        assert_eq!(packet.msg_sig, Some(msg_sig));
+    }
+
+    // Test that a Packet without a signature round-trips through build_packet/unpack unchanged
+    #[test]
+    fn test_build_and_unpack_packet_without_signature() {
+        let message = b"hello".to_vec();
+
+        let packet_bytes = Packet::build_packet(message.clone(), None).unwrap();
+        let packet = Packet::unpack(&packet_bytes).unwrap();
+
+        assert_eq!(packet.message, message);
+        assert_eq!(packet.msg_sig, None);
+    }
+
+    // Test that unpacking malformed bytes returns an error instead of panicking
+    #[test]
+    fn test_unpack_invalid_bytes_returns_err() {
+        let garbage = vec![1, 2, 3];
+        assert!(Packet::unpack(&garbage).is_err());
+    }
+
+    // Test that PeerResult::Reply serializes and deserializes without losing data, guarding the
+    // MsgFwdValues wire format against a broken derive
+    #[test]
+    fn test_peer_result_reply_round_trip() {
+        let packet = Packet::new(b"value".to_vec(), Some(b"sig".to_vec()));
+        let peer_result = PeerResult::Reply(packet.clone());
+
+        let serialized = serialize(&peer_result).unwrap();
+        let deserialized: PeerResult = deserialize(&serialized).unwrap();
+
+        assert_eq!(deserialized, PeerResult::Reply(packet));
+    }
+
+    // Test that PeerResult::Unreachable serializes and deserializes without losing data
+    #[test]
+    fn test_peer_result_unreachable_round_trip() {
+        let peer_result = PeerResult::Unreachable(42);
+
+        let serialized = serialize(&peer_result).unwrap();
+        let deserialized: PeerResult = deserialize(&serialized).unwrap();
+
+        assert_eq!(deserialized, PeerResult::Unreachable(42));
+    }
+}
