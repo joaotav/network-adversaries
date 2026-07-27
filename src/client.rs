@@ -14,6 +14,16 @@ use crate::message::Message;
 use crate::network_utils::*;
 use crate::packet::{Packet, PeerResult};
 
+/// The outcome a relay reported for a specific peer it was asked to query on the client's
+/// behalf, once its `PeerResult` has been authenticated (or found not to be authenticatable).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PeerOutcome {
+    /// The peer's value, extracted from a validly-signed `MsgSendValue`.
+    Value(u64),
+    /// The relay's claim that the peer could not be reached.
+    Unreachable,
+}
+
 /// Represents a game client.
 ///
 /// Clients are responsible for communicating with deployed agents
@@ -25,9 +35,9 @@ pub struct Client {
     /// A vector containing information that allows the client to communicate with agents.
     peers: Vec<AgentConfig>,
     /// Tracks, per relay agent ID, the number of relay protocol violations detected across
-    /// rounds played by this client (tampered replies or undeclared missing peers). Shared (not
-    /// duplicated) across clones of `Client`, since each round clones `self` into an `Arc` for
-    /// its concurrent per-peer tasks.
+    /// rounds played by this client (tampered replies, undeclared missing peers, or claims
+    /// contradicted by another relay). Shared (not duplicated) across clones of `Client`, since
+    /// each round clones `self` into an `Arc` for its concurrent per-peer tasks.
     relay_violations: Arc<Mutex<HashMap<usize, u32>>>,
 }
 
@@ -254,16 +264,15 @@ impl Client {
     }
 
     /// Receives and processes the contents of `Message::MsgFwdValues`, sent by the relay agent
-    /// identified by `relay_id`. Returns a `Vec<Message>` containing all the valid/authenticated
-    /// messages extracted from `MsgFwdValues` and `anyhow::Error` otherwise.
+    /// identified by `relay_id`. Returns a `Vec<(usize, PeerOutcome)>` pairing each reported
+    /// peer's `agent_id` with the outcome the relay claimed for it (a value, once its signature
+    /// has been authenticated, or an unreachability claim). Returns `anyhow::Error` if the outer
+    /// `MsgFwdValues` itself is unsigned or fails authentication.
     ///
     /// Any peer this client expected an answer for (i.e. every entry in `self.peers` other than
-    /// the relay itself) that `peer_results` doesn't account for at all - neither a `Reply` nor
-    /// an `Unreachable` claim - is recorded as a relay violation, since silently dropping a peer
-    /// entirely would otherwise bypass per-packet signature verification. A `Reply` whose
-    /// signature fails to verify (a tampered forward) is recorded the same way. `Unreachable`
-    /// claims are not yet cross-checked against other relays for contradictions - see follow-up
-    /// work.
+    /// the relay itself) that the relay's `peer_results` doesn't account for at all - neither a
+    /// `Reply` nor an `Unreachable` claim - is recorded as a relay violation, since silently
+    /// dropping a peer from the results entirely bypasses per-packet signature verification.
     fn handle_msg_fwd_values(
         &self,
         message_bytes: &[u8],
@@ -271,7 +280,7 @@ impl Client {
         peer_results: &Vec<PeerResult>,
         relay_id: usize,
         agent_pubkey: &str,
-    ) -> anyhow::Result<Vec<Message>> {
+    ) -> anyhow::Result<Vec<(usize, PeerOutcome)>> {
         if let Some(signature) = signature {
             Keys::verify(message_bytes, signature, agent_pubkey)?;
         } else {
@@ -280,43 +289,38 @@ impl Client {
             );
         }
 
-        let mut received_messages: Vec<Message> = Vec::new();
+        let mut outcomes: Vec<(usize, PeerOutcome)> = Vec::new();
         let mut covered_ids: HashSet<usize> = HashSet::new();
 
         for peer_result in peer_results {
-            let packet = match peer_result {
-                PeerResult::Reply(packet) => packet,
-                // Not yet cross-checked against other relays; see NOTE above.
-                PeerResult::Unreachable(agent_id) => {
-                    covered_ids.insert(*agent_id);
-                    continue;
-                }
-            };
-
-            match Message::deserialize_message(&packet.message) {
-                Ok(Message::MsgSendValue { agent_id, value }) => {
-                    covered_ids.insert(agent_id);
-                    // Retrieve the public key of the agent who sent this `MsgSendValue`
-                    if let Some(agent_pubkey) = self.get_agent_pubkey(agent_id) {
-                        match Self::handle_msg_send_value(
-                            &packet.message,
-                            &packet.msg_sig,
-                            &agent_pubkey,
-                        ) {
-                            // The received MsgSendValue was authenticated sucessfully
-                            Ok(()) => {
-                                received_messages.push(Message::MsgSendValue { agent_id, value })
+            match peer_result {
+                PeerResult::Reply(packet) => match Message::deserialize_message(&packet.message) {
+                    Ok(Message::MsgSendValue { agent_id, value }) => {
+                        covered_ids.insert(agent_id);
+                        // Retrieve the public key of the agent who allegedly sent this MsgSendValue
+                        if let Some(peer_pubkey) = self.get_agent_pubkey(agent_id) {
+                            match Self::handle_msg_send_value(
+                                &packet.message,
+                                &packet.msg_sig,
+                                &peer_pubkey,
+                            ) {
+                                // The received MsgSendValue was authenticated sucessfully
+                                Ok(()) => outcomes.push((agent_id, PeerOutcome::Value(value))),
+                                // Invalid signature: the relay tampered with the forwarded bytes
+                                Err(_) => self.record_relay_violation(relay_id),
                             }
-                            // Invalid signature: the relay tampered with the forwarded bytes
-                            Err(_) => self.record_relay_violation(relay_id),
                         }
                     }
+                    // If the forwarded message is not a MsgSendValue, ignore it
+                    Ok(_) => (),
+                    // The message could not be deserialized
+                    // NOTE: It would be an improvement to log this and other similar types of errors
+                    Err(_) => (),
+                },
+                PeerResult::Unreachable(agent_id) => {
+                    covered_ids.insert(*agent_id);
+                    outcomes.push((*agent_id, PeerOutcome::Unreachable));
                 }
-                // If the forwarded message is not a MsgSendValue, ignore it
-                Ok(_) => (),
-                // The message could not be deserialized
-                // NOTE: It would be an improvement to log this and other similar types of errors
-                Err(_) => (),
             }
         }
 
@@ -327,18 +331,19 @@ impl Client {
             }
         }
 
-        Ok(received_messages)
+        Ok(outcomes)
     }
 
     /// Builds a `MsgFetchValues`, sends it to the agent at the other end of the `socket`
-    /// TcpStream and expects a `MsgFwdValues` as a reply. Returns a `Vec<Message>` containing the
-    /// messages forwarded by the agent if successful and `anyhow::Error` otherwise.
+    /// TcpStream and expects a `MsgFwdValues` as a reply. Returns a `Vec<(usize, PeerOutcome)>`
+    /// pairing each peer's `agent_id` with the outcome the relay reported for it, if successful,
+    /// and `anyhow::Error` otherwise.
     async fn send_msg_fetch_values(
         client: Arc<Self>,
         socket: &mut TcpStream,
         agent_id: usize,
         agent_pubkey: &str,
-    ) -> anyhow::Result<Vec<Message>> {
+    ) -> anyhow::Result<Vec<(usize, PeerOutcome)>> {
         let message = Message::build_msg_fetch_values(agent_id, &client.peers)
             .context("[!] error: failed to build MsgFetchValues\n")?;
 
@@ -421,6 +426,12 @@ impl Client {
     /// other agents that are not in the subset and cannot be reached directly. This function returns
     /// a `Vec<u64>` containing all the valid unique values received from agents. A message containing
     /// a value is only valid if the client can verify that it was signed by the sending agent.
+    ///
+    /// When more than one relay in `expert_subset` is asked about the same peer, their reports are
+    /// cross-checked against each other before being counted: a relay's `Unreachable` claim for a
+    /// peer that another relay reports a validly-signed `Value` for in the same round is a
+    /// self-forgeable claim contradicted by a signature the contradicting relay cannot have
+    /// forged, so it is flagged as a relay violation (see `Client::reconcile_reports`).
     pub async fn play_expert_round(
         &self,
         expert_subset: &Vec<AgentConfig>,
@@ -428,7 +439,9 @@ impl Client {
         let mut agent_conn_handles = Vec::new();
         let client_arc = Arc::new(self.clone());
 
-        let mut agent_values: HashSet<(usize, u64)> = HashSet::new();
+        // Maps each target agent_id to the (relay_id, outcome) reports received about it this
+        // round, so reports about the same peer via different relay paths can be compared.
+        let mut reports: HashMap<usize, Vec<(usize, PeerOutcome)>> = HashMap::new();
 
         for peer in expert_subset {
             let address = peer.get_address();
@@ -451,38 +464,75 @@ impl Client {
             let agent_pubkey = peer.get_public_key().to_owned();
             let agent_id = peer.get_id();
             let handle = spawn(async move {
-                Self::send_msg_fetch_values(client, &mut socket, agent_id, &agent_pubkey).await
+                let outcomes =
+                    Self::send_msg_fetch_values(client, &mut socket, agent_id, &agent_pubkey)
+                        .await;
+                (agent_id, outcomes)
             });
             agent_conn_handles.push(handle);
         }
 
         for handle in agent_conn_handles {
             match handle.await {
-                Ok(Ok(fetched_messages)) => {
-                    // Keep only the previously unknown values contained in the `MsgFwdValues`
-                    Self::filter_unique_values(&mut agent_values, &fetched_messages)
+                Ok((relay_id, Ok(outcomes))) => {
+                    for (target_id, outcome) in outcomes {
+                        reports
+                            .entry(target_id)
+                            .or_insert_with(Vec::new)
+                            .push((relay_id, outcome));
+                    }
                 }
-                Ok(Err(e)) => println!("{}", e),
+                Ok((_relay_id, Err(e))) => println!("{}", e),
                 Err(e) => println!("[!] error: task panicked - {}\n", e),
             }
         }
 
+        self.reconcile_reports(&reports);
+
+        let agent_values = Self::extract_unique_values(&reports);
         let agent_values: Vec<u64> = agent_values.iter().map(|&(_, value)| value).collect();
 
         Ok(agent_values)
     }
 
-    /// Receives a vector of messages `&Vec<Message>`, extracts all `MsgSendValue` it contains and
-    /// uses a HashSet to store only the tuples (agent_id, value) which were not yet known.
-    fn filter_unique_values(received_values: &mut HashSet<(usize, u64)>, messages: &Vec<Message>) {
-        for message in messages {
-            match message {
-                Message::MsgSendValue { agent_id, value } => {
-                    let _ = received_values.insert((*agent_id, *value));
+    /// Cross-checks this round's reports for each target peer. A relay's own value can't be
+    /// forged (it carries the peer's Ed25519 signature), so a peer that produced a validly-signed
+    /// `Value` report through one relay was demonstrably reachable in this round - any other
+    /// relay that reported the same peer as `Unreachable` is therefore caught in a falsifiable,
+    /// attributable claim and is recorded as a relay violation.
+    ///
+    /// This only detects contradictions when a peer is reported on by more than one relay in
+    /// `expert_subset`; it does not provide Byzantine-fault-tolerant guarantees against a
+    /// colluding majority of relays agreeing on the same false claim.
+    fn reconcile_reports(&self, reports: &HashMap<usize, Vec<(usize, PeerOutcome)>>) {
+        for reported in reports.values() {
+            let has_value = reported
+                .iter()
+                .any(|(_, outcome)| matches!(outcome, PeerOutcome::Value(_)));
+            if !has_value {
+                continue;
+            }
+            for (relay_id, outcome) in reported {
+                if *outcome == PeerOutcome::Unreachable {
+                    self.record_relay_violation(*relay_id);
                 }
-                _ => (),
             }
         }
+    }
+
+    /// Extracts a deduplicated set of (agent_id, value) pairs from this round's reports.
+    fn extract_unique_values(
+        reports: &HashMap<usize, Vec<(usize, PeerOutcome)>>,
+    ) -> HashSet<(usize, u64)> {
+        let mut values = HashSet::new();
+        for (&target_id, reported) in reports {
+            for (_, outcome) in reported {
+                if let PeerOutcome::Value(value) = outcome {
+                    values.insert((target_id, *value));
+                }
+            }
+        }
+        values
     }
 
     /// Connects to `address`:`port` and sends a `MsgKillAgent` addressed to `agent_id`.
@@ -622,7 +672,7 @@ mod tests {
         let fwd_message = Message::build_msg_fwd_values(relay_id, &peer_results).unwrap();
         let fwd_sig = relay_keys.sign(&fwd_message).unwrap();
 
-        let received_messages = client
+        let outcomes = client
             .handle_msg_fwd_values(
                 &fwd_message,
                 &Some(fwd_sig),
@@ -632,13 +682,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            received_messages,
-            vec![Message::MsgSendValue {
-                agent_id: 1,
-                value: 42
-            }]
-        );
+        assert_eq!(outcomes, vec![(1, PeerOutcome::Value(42))]);
         assert_eq!(client.get_relay_violations(relay_id), 1);
     }
 
@@ -661,7 +705,7 @@ mod tests {
         let fwd_message = Message::build_msg_fwd_values(relay_id, &peer_results).unwrap();
         let fwd_sig = relay_keys.sign(&fwd_message).unwrap();
 
-        let received_messages = client
+        let outcomes = client
             .handle_msg_fwd_values(
                 &fwd_message,
                 &Some(fwd_sig),
@@ -671,7 +715,55 @@ mod tests {
             )
             .unwrap();
 
-        assert!(received_messages.is_empty());
+        assert_eq!(outcomes, vec![(1, PeerOutcome::Unreachable)]);
         assert_eq!(client.get_relay_violations(relay_id), 0);
+    }
+
+    #[test]
+    fn test_reconcile_reports_flags_contradicted_unreachable_claim() {
+        let client = Client::new();
+
+        let mut reports: HashMap<usize, Vec<(usize, PeerOutcome)>> = HashMap::new();
+        // Relay 10 vouches for peer 5 with a value; relay 20 claims peer 5 is unreachable in the
+        // same round - relay 20's claim is falsified by relay 10's unforgeable signed value.
+        reports.insert(
+            5,
+            vec![(10, PeerOutcome::Value(7)), (20, PeerOutcome::Unreachable)],
+        );
+
+        client.reconcile_reports(&reports);
+
+        assert_eq!(client.get_relay_violations(20), 1);
+        assert_eq!(client.get_relay_violations(10), 0);
+    }
+
+    #[test]
+    fn test_reconcile_reports_no_violation_without_contradiction() {
+        let client = Client::new();
+
+        let mut reports: HashMap<usize, Vec<(usize, PeerOutcome)>> = HashMap::new();
+        // Both relays agree the peer is unreachable - no signed value contradicts this claim.
+        reports.insert(
+            5,
+            vec![(10, PeerOutcome::Unreachable), (20, PeerOutcome::Unreachable)],
+        );
+
+        client.reconcile_reports(&reports);
+
+        assert_eq!(client.get_relay_violations(10), 0);
+        assert_eq!(client.get_relay_violations(20), 0);
+    }
+
+    #[test]
+    fn test_extract_unique_values_ok() {
+        let mut reports: HashMap<usize, Vec<(usize, PeerOutcome)>> = HashMap::new();
+        reports.insert(
+            1,
+            vec![(10, PeerOutcome::Value(5)), (11, PeerOutcome::Value(5))],
+        );
+        reports.insert(2, vec![(10, PeerOutcome::Unreachable)]);
+
+        let values = Client::extract_unique_values(&reports);
+        assert_eq!(values, HashSet::from([(1, 5)]));
     }
 }

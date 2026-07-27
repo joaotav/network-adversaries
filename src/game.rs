@@ -76,8 +76,9 @@ impl Game {
     }
 
     /// Prints a warning for every agent in `expert_subset` that has at least one relay protocol
-    /// violation recorded against it (tampered replies or undeclared missing peers), so the user
-    /// can see when a relay from this round has been caught misbehaving.
+    /// violation recorded against it (tampered replies, undeclared missing peers, or claims
+    /// contradicted by another relay), so the user can see when a relay from this round has been
+    /// caught misbehaving.
     fn print_relay_violations(&self, expert_subset: &Vec<AgentConfig>) {
         for agent in expert_subset {
             let violations = self.game_client.get_relay_violations(agent.get_id());
@@ -526,9 +527,9 @@ impl Game {
     /// `num_honest` and number of liars `num_liars`. It ensures the set is composed only of agents
     /// that are currently spawned and reachable, and prefers to exclude agents with at least one
     /// recorded relay violation (see `Client::get_relay_violations`) from prior rounds, since
-    /// those relays have already been caught tampering with or omitting a peer's reply. The
-    /// method returns a `Vec<AgentConfig>` containing information about the agents included in
-    /// the set.
+    /// those relays have already been caught tampering with, omitting, or falsely denying a
+    /// peer's reply. The method returns a `Vec<AgentConfig>` containing information about the
+    /// agents included in the set.
     fn get_expert_subset(&self, num_honest: u16, num_liars: u16) -> Vec<AgentConfig> {
         // Create a clone of the active_agents vector and remove all the agents whose status is
         // not equal to `AgentStatus::Ready`. Shuffle the resulting vector and use it to select
